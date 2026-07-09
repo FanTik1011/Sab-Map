@@ -627,6 +627,7 @@ function renderSidebar() {
     const total = filtered.reduce((sum, category) => sum + category.count, 0);
     const head = document.createElement("label");
     head.className = "bucket-title";
+    head.style.setProperty("--cat-color", bucket.color);
     head.innerHTML = `
       <input class="check" type="checkbox" ${enabled === filtered.length ? "checked" : ""}>
       <h2>${bucket.title}</h2>
