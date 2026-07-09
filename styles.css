@@ -45,11 +45,16 @@ button {
 .map-page {
   display: grid;
   grid-template-columns: 360px minmax(0, 1fr);
+  transition: grid-template-columns 0.22s ease;
   width: 100%;
 }
 
 .map-page.sidebar-closed {
   grid-template-columns: 0 minmax(0, 1fr);
+}
+
+.map-page.sidebar-closed .sidebar {
+  opacity: 0;
 }
 
 .sidebar {
@@ -62,6 +67,7 @@ button {
   margin: 18px;
   min-width: 0;
   overflow: hidden;
+  transition: opacity 0.18s ease;
   width: 324px;
   z-index: 5;
 }
@@ -153,15 +159,23 @@ h1 small {
   display: grid;
   height: 32px;
   place-items: center;
-  transition: background 0.12s ease, border-color 0.12s ease;
+  transition: background 0.15s ease, border-color 0.15s ease, transform 0.15s ease, box-shadow 0.15s ease;
   width: 32px;
 }
 
 .icon-button:hover,
 .reopen:hover,
 .map-controls button:hover {
-  background: rgba(255, 255, 255, 0.16);
+  background: rgba(125, 99, 255, 0.24);
   border-color: var(--accent);
+  box-shadow: 0 0 0 4px rgba(125, 99, 255, 0.14);
+  transform: translateY(-1px);
+}
+
+.icon-button:active,
+.reopen:active,
+.map-controls button:active {
+  transform: translateY(0);
 }
 
 .tabs {
@@ -177,10 +191,16 @@ h1 small {
   color: var(--text-soft);
   font-weight: 800;
   height: 42px;
+  transition: background 0.15s ease, color 0.15s ease;
 }
 
 .tab + .tab {
   border-left: 1px solid rgba(105, 84, 214, 0.26);
+}
+
+.tab:hover:not(.is-active) {
+  background: rgba(125, 99, 255, 0.12);
+  color: var(--text);
 }
 
 .tab.is-active {
@@ -215,12 +235,19 @@ h1 small {
   min-height: 42px;
   outline: none;
   padding: 0 13px;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
   width: 100%;
+}
+
+.search input:hover,
+.coord-grid input:hover {
+  border-color: rgba(143, 120, 255, 0.9);
 }
 
 .search input:focus,
 .coord-grid input:focus {
   border-color: var(--accent);
+  box-shadow: 0 0 0 4px rgba(125, 99, 255, 0.18);
 }
 
 .bulk-actions {
@@ -241,11 +268,20 @@ h1 small {
   height: 34px;
   letter-spacing: 1px;
   text-transform: uppercase;
+  transition: background 0.15s ease, border-color 0.15s ease, transform 0.15s ease, box-shadow 0.15s ease;
 }
 
 .bulk-actions button:hover,
 .coord-grid button:hover {
-  background: rgba(125, 99, 255, 0.22);
+  background: rgba(125, 99, 255, 0.28);
+  border-color: var(--accent);
+  box-shadow: 0 4px 14px rgba(125, 99, 255, 0.24);
+  transform: translateY(-1px);
+}
+
+.bulk-actions button:active,
+.coord-grid button:active {
+  transform: translateY(0);
 }
 
 .buckets {
@@ -257,15 +293,36 @@ h1 small {
   scrollbar-width: thin;
 }
 
+.buckets::-webkit-scrollbar {
+  width: 8px;
+}
+
+.buckets::-webkit-scrollbar-thumb {
+  background: var(--accent-dim);
+  border-radius: 999px;
+  transition: background 0.15s ease;
+}
+
+.buckets::-webkit-scrollbar-thumb:hover {
+  background: var(--accent);
+}
+
 .bucket-title {
   align-items: center;
   border-bottom: 1px solid rgba(105, 84, 214, 0.36);
+  border-radius: 8px;
+  cursor: pointer;
   display: grid;
   grid-template-columns: 24px minmax(0, 1fr) auto;
   gap: 12px;
   min-height: 45px;
   padding: 0 2px;
   position: relative;
+  transition: background 0.15s ease;
+}
+
+.bucket-title:hover {
+  background: rgba(125, 99, 255, 0.1);
 }
 
 .bucket-title h2 {
@@ -287,7 +344,13 @@ h1 small {
   height: 20px;
   margin: 0;
   position: relative;
+  transition: background 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
   width: 20px;
+}
+
+.check:hover {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 4px rgba(125, 99, 255, 0.16);
 }
 
 .check:checked {
@@ -312,6 +375,7 @@ h1 small {
   background: rgba(26, 25, 55, 0.72);
   border: 1px solid transparent;
   border-radius: 13px;
+  cursor: pointer;
   display: grid;
   gap: 12px;
   grid-template-columns: 22px 30px minmax(0, 1fr) auto;
@@ -319,6 +383,7 @@ h1 small {
   min-height: 46px;
   opacity: 0.52;
   padding: 0 10px;
+  transition: background 0.15s ease, border-color 0.15s ease, opacity 0.15s ease, transform 0.15s ease, box-shadow 0.15s ease;
 }
 
 .category.is-on {
@@ -329,6 +394,19 @@ h1 small {
 
 .category:hover {
   background: rgba(55, 50, 108, 0.96);
+  border-color: rgba(125, 99, 255, 0.5);
+  box-shadow: 0 6px 16px rgba(20, 14, 50, 0.4);
+  opacity: 1;
+  transform: translateY(-1px);
+}
+
+.category:hover .cat-icon {
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.category:hover .cat-title {
+  color: var(--text);
 }
 
 .cat-icon {
@@ -344,6 +422,7 @@ h1 small {
   line-height: 1;
   place-items: center;
   text-shadow: 0 1px 6px #000;
+  transition: border-color 0.15s ease, color 0.15s ease;
   width: 26px;
 }
 
@@ -361,6 +440,7 @@ h1 small {
   font-weight: 800;
   overflow: hidden;
   text-overflow: ellipsis;
+  transition: color 0.15s ease;
   white-space: nowrap;
 }
 
@@ -422,6 +502,7 @@ h1 small {
 
 .map-stage {
   background: #03101a;
+  contain: layout paint size;
   min-width: 0;
   overflow: hidden;
   position: relative;
@@ -430,8 +511,20 @@ h1 small {
 #mapCanvas {
   cursor: grab;
   display: block;
-  height: 100%;
-  width: 100%;
+  left: -320px;
+  position: absolute;
+  top: -320px;
+  touch-action: none;
+  user-select: none;
+  will-change: transform;
+}
+
+#markerCanvas {
+  display: block;
+  left: -320px;
+  pointer-events: none;
+  position: absolute;
+  top: -320px;
 }
 
 .reopen {
@@ -440,6 +533,44 @@ h1 small {
   position: absolute;
   top: 14px;
   z-index: 6;
+}
+
+.map-loading {
+  align-items: center;
+  background: #03101a;
+  color: var(--text-soft);
+  display: flex;
+  flex-direction: column;
+  font-size: 13px;
+  font-weight: 700;
+  gap: 14px;
+  inset: 0;
+  justify-content: center;
+  letter-spacing: 0.4px;
+  opacity: 1;
+  pointer-events: none;
+  position: absolute;
+  transition: opacity 0.3s ease;
+  z-index: 8;
+}
+
+.map-loading.is-hidden {
+  opacity: 0;
+}
+
+.map-loading-spinner {
+  animation: map-loading-spin 0.9s linear infinite;
+  border: 3px solid rgba(118, 245, 236, 0.18);
+  border-radius: 50%;
+  border-top-color: var(--accent);
+  height: 36px;
+  width: 36px;
+}
+
+@keyframes map-loading-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .sidebar-closed .reopen {

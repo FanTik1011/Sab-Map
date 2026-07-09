@@ -4,6 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Subnautica 2 Interactive Map</title>
+    <link rel="preconnect" href="https://subnautica2.gg" crossorigin>
     <link rel="stylesheet" href="styles.css">
   </head>
   <body>
@@ -53,6 +54,11 @@
       <section class="map-stage">
         <button class="reopen" id="openSidebar" type="button" aria-label="Відкрити панель">›</button>
         <canvas id="mapCanvas"></canvas>
+        <canvas id="markerCanvas"></canvas>
+        <div class="map-loading" id="mapLoading">
+          <div class="map-loading-spinner"></div>
+          <span>Завантаження карти…</span>
+        </div>
         <div class="hud top-left">
           <strong id="visibleCount">0</strong>
           <span>visible markers</span>

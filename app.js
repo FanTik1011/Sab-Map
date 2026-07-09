@@ -127,17 +127,22 @@ const imageCache = new Map();
 
 const canvas = document.querySelector("#mapCanvas");
 const ctx = canvas.getContext("2d", { alpha: false });
+const markerCanvas = document.querySelector("#markerCanvas");
+const markerCtx = markerCanvas.getContext("2d");
 const bucketList = document.querySelector("#bucketList");
 const searchInput = document.querySelector("#searchInput");
 const visibleCount = document.querySelector("#visibleCount");
 const popup = document.querySelector("#popup");
 const page = document.querySelector(".map-page");
+const mapStage = document.querySelector(".map-stage");
 const coordX = document.querySelector("#coordX");
 const coordY = document.querySelector("#coordY");
 const positionReadout = document.querySelector("#positionReadout");
 
-let dpr = 1;
+const canvasBuffer = 320;
+let dpr = Math.min(window.devicePixelRatio || 1, 2);
 let view = { x: 0, y: 0, scale: 1 };
+let renderedView = { x: 0, y: 0, scale: 1 };
 let minScale = 0.001;
 let isDragging = false;
 let dragStart = null;
@@ -148,11 +153,35 @@ let allMarkers = [];
 let visibleMarkers = [];
 let categoryIndex = new Map();
 let drawQueued = false;
+let transformQueued = false;
 let isInteracting = false;
+let interactionMode = null;
 let interactionTimer = null;
+let wheelQueued = false;
+let wheelPoint = null;
+let wheelFactor = 1;
+let cachedMapSize = null;
 const tileCache = new Map();
+const tileLoadQueue = [];
+let activeTileLoads = 0;
+let tileRequestSeq = 0;
+const maxConcurrentTileLoads = 24;
 
 function scheduleDraw() {
+  scheduleMarkerDraw();
+  if (isInteracting) {
+    if (performance.now() - interactionStartedAt > maxInteractionStretch) {
+      interactionStartedAt = performance.now();
+      queueDraw();
+      return;
+    }
+    scheduleCanvasTransform();
+    return;
+  }
+  queueDraw();
+}
+
+function queueDraw() {
   if (drawQueued) return;
   drawQueued = true;
   window.requestAnimationFrame(() => {
@@ -161,8 +190,79 @@ function scheduleDraw() {
   });
 }
 
-function beginInteraction() {
+let markerDrawQueued = false;
+function scheduleMarkerDraw() {
+  if (markerDrawQueued) return;
+  markerDrawQueued = true;
+  window.requestAnimationFrame(() => {
+    markerDrawQueued = false;
+    renderMarkersLayer();
+  });
+}
+
+function scheduleCanvasTransform() {
+  if (transformQueued) return;
+  transformQueued = true;
+  window.requestAnimationFrame(() => {
+    transformQueued = false;
+    applyCanvasTransform();
+  });
+}
+
+function applyCanvasTransform() {
+  const scale = view.scale / renderedView.scale;
+  const x = view.x - renderedView.x * scale;
+  const y = view.y - renderedView.y * scale;
+  canvas.style.transformOrigin = "0 0";
+  canvas.style.transform = `translate3d(${x}px, ${y}px, 0) scale(${scale})`;
+}
+
+function scheduleWheelZoom(point, factor) {
+  wheelPoint = point;
+  wheelFactor *= factor;
+  if (wheelQueued) return;
+  wheelQueued = true;
+  window.requestAnimationFrame(() => {
+    wheelQueued = false;
+    if (!wheelPoint) return;
+    const nextPoint = wheelPoint;
+    const nextFactor = wheelFactor;
+    wheelPoint = null;
+    wheelFactor = 1;
+    zoomAt(nextPoint.x, nextPoint.y, nextFactor);
+  });
+}
+
+function stageSize() {
+  return {
+    width: mapStage.clientWidth,
+    height: mapStage.clientHeight
+  };
+}
+
+function visibleCenter() {
+  const size = stageSize();
+  return {
+    x: canvasBuffer + size.width / 2,
+    y: canvasBuffer + size.height / 2
+  };
+}
+
+function eventToCanvasPoint(event) {
+  const rect = mapStage.getBoundingClientRect();
+  return {
+    x: event.clientX - rect.left + canvasBuffer,
+    y: event.clientY - rect.top + canvasBuffer
+  };
+}
+
+let interactionStartedAt = 0;
+const maxInteractionStretch = 1200;
+
+function beginInteraction(mode = "pan") {
+  if (!isInteracting) interactionStartedAt = performance.now();
   isInteracting = true;
+  interactionMode = mode;
   if (interactionTimer) window.clearTimeout(interactionTimer);
 }
 
@@ -170,6 +270,7 @@ function endInteraction(delay = 120) {
   if (interactionTimer) window.clearTimeout(interactionTimer);
   interactionTimer = window.setTimeout(() => {
     isInteracting = false;
+    interactionMode = null;
     scheduleDraw();
   }, delay);
 }
@@ -195,17 +296,20 @@ function rng(seed) {
 }
 
 function mapSize() {
+  if (cachedMapSize) return cachedMapSize;
   if (tileConfig.enabled) {
     const extent = mapPixelExtent();
-    return {
+    cachedMapSize = {
       width: extent.maxX - extent.minX,
       height: extent.maxY - extent.minY
     };
+    return cachedMapSize;
   }
-  return {
+  cachedMapSize = {
     width: bounds.xMax - bounds.xMin,
     height: bounds.yMax - bounds.yMin
   };
+  return cachedMapSize;
 }
 
 function worldToScreen(x, y) {
@@ -268,19 +372,23 @@ function sourcePixelToWorld(pixelX, pixelY) {
   };
 }
 
+let cachedMapPixelExtent = null;
+
 function mapPixelExtent() {
+  if (cachedMapPixelExtent) return cachedMapPixelExtent;
   const corners = [
     worldToSourcePixel(bounds.xMin, bounds.yMin),
     worldToSourcePixel(bounds.xMax, bounds.yMin),
     worldToSourcePixel(bounds.xMax, bounds.yMax),
     worldToSourcePixel(bounds.xMin, bounds.yMax)
   ];
-  return {
+  cachedMapPixelExtent = {
     minX: Math.min(...corners.map((point) => point.x)),
     maxX: Math.max(...corners.map((point) => point.x)),
     minY: Math.min(...corners.map((point) => point.y)),
     maxY: Math.max(...corners.map((point) => point.y))
   };
+  return cachedMapPixelExtent;
 }
 
 function assetUrl(path) {
@@ -436,9 +544,70 @@ function categoryVisible(key) {
   return categoryIndex.get(key)?.visible || false;
 }
 
+let markerGrid = new Map();
+let gridCellSize = Math.max(1, (bounds.xMax - bounds.xMin) / 120);
+let visibleMarkerSet = new Set();
+
 function refreshVisibleMarkers() {
   visibleMarkers = allMarkers.filter((marker) => categoryVisible(marker.categoryKey));
+  visibleMarkerSet = new Set(visibleMarkers);
   visibleCount.textContent = visibleMarkers.length.toLocaleString("en-US");
+  markerGrid = new Map();
+  for (const marker of visibleMarkers) {
+    const key = `${Math.floor(marker.x / gridCellSize)}:${Math.floor(marker.y / gridCellSize)}`;
+    let cell = markerGrid.get(key);
+    if (!cell) {
+      cell = [];
+      markerGrid.set(key, cell);
+    }
+    cell.push(marker);
+  }
+}
+
+function getViewportWorldBounds(padding = 80) {
+  const width = canvas.width / dpr;
+  const height = canvas.height / dpr;
+  const corners = [
+    screenToWorld(-padding, -padding),
+    screenToWorld(width + padding, -padding),
+    screenToWorld(width + padding, height + padding),
+    screenToWorld(-padding, height + padding)
+  ];
+  return {
+    minX: Math.min(...corners.map((point) => point.x)),
+    maxX: Math.max(...corners.map((point) => point.x)),
+    minY: Math.min(...corners.map((point) => point.y)),
+    maxY: Math.max(...corners.map((point) => point.y))
+  };
+}
+
+function getVisibleMarkersInViewport(padding = 80) {
+  if (!visibleMarkers.length) return [];
+  const viewport = getViewportWorldBounds(padding);
+  const minCellX = Math.floor(viewport.minX / gridCellSize);
+  const maxCellX = Math.floor(viewport.maxX / gridCellSize);
+  const minCellY = Math.floor(viewport.minY / gridCellSize);
+  const maxCellY = Math.floor(viewport.maxY / gridCellSize);
+  const markers = [];
+
+  for (let cx = minCellX; cx <= maxCellX; cx += 1) {
+    for (let cy = minCellY; cy <= maxCellY; cy += 1) {
+      const cell = markerGrid.get(`${cx}:${cy}`);
+      if (!cell) continue;
+      for (const marker of cell) {
+        if (
+          marker.x >= viewport.minX &&
+          marker.x <= viewport.maxX &&
+          marker.y >= viewport.minY &&
+          marker.y <= viewport.maxY
+        ) {
+          markers.push(marker);
+        }
+      }
+    }
+  }
+
+  return markers;
 }
 
 function renderSidebar() {
@@ -584,8 +753,8 @@ function drawMapBackground() {
 }
 
 function chooseTileZoom() {
-  const desired = tileConfig.sourceZoom + Math.log2(Math.max(0.0001, view.scale));
-  return Math.max(tileConfig.minZoom, Math.min(tileConfig.maxZoom, Math.round(desired + 2)));
+  const desired = tileConfig.sourceZoom + Math.log2(Math.max(0.0001, view.scale) * dpr);
+  return Math.max(tileConfig.minZoom, Math.min(tileConfig.maxZoom, Math.round(desired)));
 }
 
 function tileUrl(z, x, y) {
@@ -595,21 +764,128 @@ function tileUrl(z, x, y) {
     .replace("{y}", String(y));
 }
 
-function getTile(z, x, y) {
+const maxCachedTiles = 900;
+const pinnedTileKeys = new Set();
+
+const pendingPlaceholder = { image: null, loaded: false, failed: false };
+let newTileBudget = 0;
+
+const maxQueuedTiles = 200;
+
+function requestTileLoad(entry) {
+  if (entry.loading || entry.loaded || entry.failed) return;
+  if (!entry.queued) {
+    entry.queued = true;
+    tileLoadQueue.push(entry);
+    if (tileLoadQueue.length > maxQueuedTiles) {
+      tileLoadQueue.sort((a, b) => b.priority - a.priority);
+      for (const dropped of tileLoadQueue.splice(maxQueuedTiles)) dropped.queued = false;
+    }
+  }
+  pumpTileQueue();
+}
+
+function pumpTileQueue() {
+  if (activeTileLoads >= maxConcurrentTileLoads || !tileLoadQueue.length) return;
+  tileLoadQueue.sort((a, b) => b.priority - a.priority);
+
+  while (activeTileLoads < maxConcurrentTileLoads && tileLoadQueue.length) {
+    const entry = tileLoadQueue.shift();
+    entry.queued = false;
+    if (entry.loading || entry.loaded || entry.failed) continue;
+
+    entry.loading = true;
+    activeTileLoads += 1;
+    entry.image.onload = () => {
+      activeTileLoads -= 1;
+      entry.loading = false;
+      entry.loaded = true;
+      if (isInteracting) scheduleCanvasTransform();
+      else scheduleDraw();
+      pumpTileQueue();
+    };
+    entry.image.onerror = () => {
+      activeTileLoads -= 1;
+      entry.loading = false;
+      entry.failed = true;
+      pumpTileQueue();
+    };
+    entry.image.src = entry.url;
+  }
+}
+
+function getTile(z, x, y, priority = tileRequestSeq) {
   const key = `${z}/${x}/${y}`;
-  if (tileCache.has(key)) return tileCache.get(key);
+  const existing = tileCache.get(key);
+  if (existing) {
+    existing.priority = Math.max(existing.priority || 0, priority);
+    requestTileLoad(existing);
+    return existing;
+  }
+  if (newTileBudget <= 0) return pendingPlaceholder;
+  newTileBudget -= 1;
   const image = new Image();
-  const entry = { image, loaded: false, failed: false };
-  image.onload = () => {
-    entry.loaded = true;
-    scheduleDraw();
+  image.decoding = "async";
+  const entry = {
+    image,
+    url: tileUrl(z, x, y),
+    loaded: false,
+    failed: false,
+    loading: false,
+    queued: false,
+    priority
   };
-  image.onerror = () => {
-    entry.failed = true;
-  };
-  image.src = tileUrl(z, x, y);
   tileCache.set(key, entry);
+  requestTileLoad(entry);
+  if (tileCache.size > maxCachedTiles) {
+    for (const oldKey of tileCache.keys()) {
+      if (pinnedTileKeys.has(oldKey)) continue;
+      const oldTile = tileCache.get(oldKey);
+      if (oldTile?.loading) continue;
+      tileCache.delete(oldKey);
+      break;
+    }
+  }
   return entry;
+}
+
+function drawFallbackTile(z, tx, ty, screenX, screenY, screenSize) {
+  for (let d = 1; d <= z - tileConfig.minZoom; d += 1) {
+    const scale = 2 ** d;
+    const pz = z - d;
+    const ptx = Math.floor(tx / scale);
+    const pty = Math.floor(ty / scale);
+    const tile = tileCache.get(`${pz}/${ptx}/${pty}`);
+    if (tile && tile.loaded && !tile.failed) {
+      const srcSize = tileConfig.tileSize / scale;
+      const sx = (tx - ptx * scale) * srcSize;
+      const sy = (ty - pty * scale) * srcSize;
+      ctx.drawImage(tile.image, sx, sy, srcSize, srcSize, screenX, screenY, screenSize, screenSize);
+      return true;
+    }
+  }
+  return false;
+}
+
+function prefetchBaseTiles() {
+  if (!tileConfig.enabled) return;
+  const extent = mapPixelExtent();
+  const z = tileConfig.minZoom;
+  const factor = 2 ** (tileConfig.sourceZoom - z);
+  const tileSpan = tileConfig.tileSize * factor;
+  const startX = Math.max(0, Math.floor(extent.minX / tileSpan));
+  const endX = Math.ceil(extent.maxX / tileSpan);
+  const startY = Math.max(0, Math.floor(extent.minY / tileSpan));
+  const endY = Math.ceil(extent.maxY / tileSpan);
+  const previousBudget = newTileBudget;
+  newTileBudget = Number.POSITIVE_INFINITY;
+  for (let tx = startX; tx <= endX; tx += 1) {
+    for (let ty = startY; ty <= endY; ty += 1) {
+      pinnedTileKeys.add(`${z}/${tx}/${ty}`);
+      getTile(z, tx, ty);
+    }
+  }
+  newTileBudget = previousBudget;
 }
 
 function drawTiles() {
@@ -620,7 +896,7 @@ function drawTiles() {
   const tileSpan = tileConfig.tileSize * factor;
   const viewWidth = canvas.width / dpr;
   const viewHeight = canvas.height / dpr;
-  const overscan = 256;
+  const overscan = 200;
   const corners = [
     { x: -overscan, y: -overscan },
     { x: viewWidth + overscan, y: -overscan },
@@ -634,33 +910,107 @@ function drawTiles() {
   const visibleMinY = Math.min(...corners.map((point) => point.y));
   const visibleMaxX = Math.max(...corners.map((point) => point.x));
   const visibleMaxY = Math.max(...corners.map((point) => point.y));
-  const startX = Math.max(0, Math.floor(visibleMinX / tileSpan) - 1);
-  const endX = Math.ceil(visibleMaxX / tileSpan) + 1;
-  const startY = Math.max(0, Math.floor(visibleMinY / tileSpan) - 1);
-  const endY = Math.ceil(visibleMaxY / tileSpan) + 1;
+  const extentMinTileX = Math.floor(extent.minX / tileSpan);
+  const extentMinTileY = Math.floor(extent.minY / tileSpan);
+  const extentMaxTileX = Math.ceil(extent.maxX / tileSpan);
+  const extentMaxTileY = Math.ceil(extent.maxY / tileSpan);
+  const startX = Math.max(0, extentMinTileX, Math.floor(visibleMinX / tileSpan) - 1);
+  const endX = Math.min(extentMaxTileX, Math.ceil(visibleMaxX / tileSpan) + 1);
+  const startY = Math.max(0, extentMinTileY, Math.floor(visibleMinY / tileSpan) - 1);
+  const endY = Math.min(extentMaxTileY, Math.ceil(visibleMaxY / tileSpan) + 1);
+  const centerTileX = (startX + endX) / 2;
+  const centerTileY = (startY + endY) / 2;
+  const requestBasePriority = ++tileRequestSeq * 10000;
   let loadedTiles = 0;
+  newTileBudget = isInteracting ? interactionMode === "zoom" ? 36 : 8 : 72;
 
   ctx.save();
-  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingEnabled = !isInteracting;
   for (let tx = startX; tx <= endX; tx += 1) {
     for (let ty = startY; ty <= endY; ty += 1) {
       if (tx < 0 || ty < 0) continue;
-      const tile = getTile(z, tx, ty);
-      if (!tile.loaded || tile.failed) continue;
+      const tileDistance = Math.abs(tx - centerTileX) + Math.abs(ty - centerTileY);
+      const tile = getTile(z, tx, ty, requestBasePriority - tileDistance);
       const sourceX = tx * tileSpan;
       const sourceY = ty * tileSpan;
       const screenX = view.x + (sourceX - extent.minX) * view.scale;
       const screenY = view.y + (sourceY - extent.minY) * view.scale;
       const screenSize = tileSpan * view.scale;
-      ctx.drawImage(tile.image, screenX, screenY, screenSize, screenSize);
-      loadedTiles += 1;
+      if (tile.loaded && !tile.failed) {
+        ctx.drawImage(tile.image, screenX, screenY, screenSize, screenSize);
+        loadedTiles += 1;
+      } else {
+        drawFallbackTile(z, tx, ty, screenX, screenY, screenSize);
+      }
     }
   }
   ctx.restore();
   return loadedTiles > 0;
 }
 
-function drawMarker(marker, isSelected = false, lightweight = false) {
+const markerSpriteCache = new Map();
+
+function buildMarkerSprite(marker, radius, isSelected, icon) {
+  const shadowBlurAmt = isSelected ? 18 : 8;
+  const halfW = radius + 8 + shadowBlurAmt;
+  const topH = radius + 8 + shadowBlurAmt;
+  const botH = radius * 1.72 + shadowBlurAmt;
+  const w = Math.ceil(halfW * 2);
+  const h = Math.ceil(topH + botH);
+  const spriteCanvas = document.createElement("canvas");
+  spriteCanvas.width = Math.max(1, Math.ceil(w * dpr));
+  spriteCanvas.height = Math.max(1, Math.ceil(h * dpr));
+  const sctx = spriteCanvas.getContext("2d");
+  sctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  sctx.translate(halfW, topH);
+  sctx.shadowColor = marker.color;
+  sctx.shadowBlur = shadowBlurAmt;
+  sctx.beginPath();
+  sctx.moveTo(0, radius * 1.72);
+  sctx.bezierCurveTo(radius + 8, -2, radius, -radius - 8, 0, -radius - 8);
+  sctx.bezierCurveTo(-radius, -radius - 8, -radius - 8, -2, 0, radius * 1.72);
+  sctx.closePath();
+  sctx.fillStyle = marker.color;
+  sctx.fill();
+  sctx.lineWidth = Math.max(2.4, radius * 0.2);
+  sctx.strokeStyle = "#061426";
+  sctx.stroke();
+  sctx.shadowBlur = 0;
+  sctx.fillStyle = "#dce7ee";
+  sctx.beginPath();
+  sctx.arc(0, -2, radius * 0.66, 0, Math.PI * 2);
+  sctx.fill();
+  if (icon) {
+    const iconSize = radius * 1.32;
+    sctx.save();
+    sctx.beginPath();
+    sctx.arc(0, -2, radius * 0.66, 0, Math.PI * 2);
+    sctx.clip();
+    sctx.drawImage(icon.image, -iconSize / 2, -2 - iconSize / 2, iconSize, iconSize);
+    sctx.restore();
+  } else {
+    sctx.fillStyle = marker.color;
+    sctx.font = `${Math.max(9, radius)}px Inter, sans-serif`;
+    sctx.textAlign = "center";
+    sctx.textBaseline = "middle";
+    sctx.fillText(marker.symbol, 0, -2);
+  }
+  return { canvas: spriteCanvas, w, h, originX: halfW, originY: topH };
+}
+
+function getMarkerSprite(marker, radius, isSelected) {
+  const cachedImage = getCachedImage(marker.iconPath, 54);
+  const iconReady = !!(cachedImage?.loaded && !cachedImage.failed);
+  const key = `${marker.bucketId}:${marker.color}:${radius}:${isSelected ? 1 : 0}:${iconReady ? marker.iconPath : `sym:${marker.symbol}`}`;
+  let sprite = markerSpriteCache.get(key);
+  if (!sprite) {
+    sprite = buildMarkerSprite(marker, radius, isSelected, iconReady ? cachedImage : null);
+    markerSpriteCache.set(key, sprite);
+  }
+  return sprite;
+}
+
+function drawMarker(marker, isSelected = false) {
   const point = worldToScreen(marker.x, marker.y);
   if (point.x < -55 || point.y < -70 || point.x > canvas.width / dpr + 55 || point.y > canvas.height / dpr + 70) return;
   const closeZoom = view.scale > 0.025;
@@ -669,127 +1019,97 @@ function drawMarker(marker, isSelected = false, lightweight = false) {
     : marker.bucketId === "locations"
       ? closeZoom ? 13 : 9
       : closeZoom ? 11 : 8;
-  const shouldDrawIcon = !lightweight || visibleMarkers.length < 350;
-  ctx.save();
-  ctx.translate(point.x, point.y);
-  ctx.shadowColor = marker.color;
-  ctx.shadowBlur = lightweight ? 0 : isSelected ? 18 : 8;
-  ctx.beginPath();
-  ctx.moveTo(0, radius * 1.72);
-  ctx.bezierCurveTo(radius + 8, -2, radius, -radius - 8, 0, -radius - 8);
-  ctx.bezierCurveTo(-radius, -radius - 8, -radius - 8, -2, 0, radius * 1.72);
-  ctx.closePath();
-  ctx.fillStyle = marker.color;
-  ctx.fill();
-  ctx.lineWidth = Math.max(2.4, radius * 0.2);
-  ctx.strokeStyle = "#061426";
-  ctx.stroke();
-  ctx.shadowBlur = 0;
-  ctx.fillStyle = "#dce7ee";
-  ctx.beginPath();
-  ctx.arc(0, -2, radius * 0.66, 0, Math.PI * 2);
-  ctx.fill();
-  const icon = shouldDrawIcon ? getCachedImage(marker.iconPath, 54) : null;
-  if (icon?.loaded && !icon.failed) {
-    const iconSize = radius * 1.32;
-    ctx.save();
-    ctx.beginPath();
-    ctx.arc(0, -2, radius * 0.66, 0, Math.PI * 2);
-    ctx.clip();
-    ctx.drawImage(icon.image, -iconSize / 2, -2 - iconSize / 2, iconSize, iconSize);
-    ctx.restore();
-  } else {
-    ctx.fillStyle = marker.color;
-    ctx.font = `${Math.max(9, radius)}px Inter, sans-serif`;
-    ctx.textAlign = "center";
-    ctx.textBaseline = "middle";
-    ctx.fillText(marker.symbol, 0, -2);
-  }
-  ctx.restore();
+  const sprite = getMarkerSprite(marker, radius, isSelected);
+  markerCtx.drawImage(sprite.canvas, point.x - sprite.originX, point.y - sprite.originY, sprite.w, sprite.h);
 }
 
 function drawIconBadge(marker, point, isSelected = false) {
   const icon = getCachedImage(marker.iconPath || marker.categoryIconPath, 54);
   const radius = isSelected ? 18 : 15;
-  ctx.save();
-  ctx.translate(point.x, point.y);
-  ctx.shadowColor = marker.color;
-  ctx.shadowBlur = isSelected ? 18 : 8;
+  markerCtx.save();
+  markerCtx.translate(point.x, point.y);
+  markerCtx.shadowColor = marker.color;
+  markerCtx.shadowBlur = isSelected ? 18 : 8;
 
-  ctx.beginPath();
-  ctx.arc(0, 0, radius, 0, Math.PI * 2);
-  ctx.fillStyle = "rgba(232, 244, 238, 0.9)";
-  ctx.fill();
-  ctx.lineWidth = isSelected ? 3 : 2;
-  ctx.strokeStyle = marker.color;
-  ctx.stroke();
+  markerCtx.beginPath();
+  markerCtx.arc(0, 0, radius, 0, Math.PI * 2);
+  markerCtx.fillStyle = "rgba(232, 244, 238, 0.9)";
+  markerCtx.fill();
+  markerCtx.lineWidth = isSelected ? 3 : 2;
+  markerCtx.strokeStyle = marker.color;
+  markerCtx.stroke();
 
-  ctx.beginPath();
-  ctx.moveTo(-5, radius - 2);
-  ctx.lineTo(0, radius + 8);
-  ctx.lineTo(5, radius - 2);
-  ctx.closePath();
-  ctx.fillStyle = "rgba(232, 244, 238, 0.9)";
-  ctx.fill();
-  ctx.stroke();
+  markerCtx.beginPath();
+  markerCtx.moveTo(-5, radius - 2);
+  markerCtx.lineTo(0, radius + 8);
+  markerCtx.lineTo(5, radius - 2);
+  markerCtx.closePath();
+  markerCtx.fillStyle = "rgba(232, 244, 238, 0.9)";
+  markerCtx.fill();
+  markerCtx.stroke();
 
-  ctx.shadowBlur = 0;
+  markerCtx.shadowBlur = 0;
   if (icon?.loaded && !icon.failed) {
     const iconSize = radius * 1.62;
-    ctx.drawImage(icon.image, -iconSize / 2, -iconSize / 2, iconSize, iconSize);
+    markerCtx.drawImage(icon.image, -iconSize / 2, -iconSize / 2, iconSize, iconSize);
   } else {
-    ctx.fillStyle = marker.color;
-    ctx.font = `900 ${radius}px Inter, sans-serif`;
-    ctx.textAlign = "center";
-    ctx.textBaseline = "middle";
-    ctx.fillText(marker.symbol, 0, 1);
+    markerCtx.fillStyle = marker.color;
+    markerCtx.font = `900 ${radius}px Inter, sans-serif`;
+    markerCtx.textAlign = "center";
+    markerCtx.textBaseline = "middle";
+    markerCtx.fillText(marker.symbol, 0, 1);
   }
 
-  ctx.restore();
+  markerCtx.restore();
 }
 
 function drawCluster(cluster) {
   const radius = Math.max(10, Math.min(25, 8 + Math.log10(cluster.count) * 8));
-  ctx.save();
-  ctx.translate(cluster.x, cluster.y);
-  ctx.shadowColor = cluster.color;
-  ctx.shadowBlur = 5;
-  ctx.beginPath();
-  ctx.arc(0, 0, radius, 0, Math.PI * 2);
-  ctx.fillStyle = cluster.color;
-  ctx.fill();
-  ctx.lineWidth = 2;
-  ctx.strokeStyle = "#06101d";
-  ctx.stroke();
-  ctx.shadowBlur = 0;
-  ctx.fillStyle = "#06101d";
-  ctx.font = `800 ${radius > 18 ? 11 : 10}px Inter, sans-serif`;
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
-  ctx.fillText(cluster.count > 999 ? `${Math.round(cluster.count / 100) / 10}k` : String(cluster.count), 0, 0);
-  ctx.restore();
+  markerCtx.save();
+  markerCtx.translate(cluster.x, cluster.y);
+  markerCtx.shadowColor = cluster.color;
+  markerCtx.shadowBlur = 5;
+  markerCtx.beginPath();
+  markerCtx.arc(0, 0, radius, 0, Math.PI * 2);
+  markerCtx.fillStyle = cluster.color;
+  markerCtx.fill();
+  markerCtx.lineWidth = 2;
+  markerCtx.strokeStyle = "#06101d";
+  markerCtx.stroke();
+  markerCtx.shadowBlur = 0;
+  markerCtx.fillStyle = "#06101d";
+  markerCtx.font = `800 ${radius > 18 ? 11 : 10}px Inter, sans-serif`;
+  markerCtx.textAlign = "center";
+  markerCtx.textBaseline = "middle";
+  markerCtx.fillText(cluster.count > 999 ? `${Math.round(cluster.count / 100) / 10}k` : String(cluster.count), 0, 0);
+  markerCtx.restore();
 }
 
 function drawVisibleMarkers() {
   const selectedId = selectedMarker?.id;
-  const lightweight = isInteracting || visibleMarkers.length > 4500;
+  const markersInFrame = getVisibleMarkersInViewport(isInteracting ? 120 : 90);
+
+  if (selectedMarker && visibleMarkerSet.has(selectedMarker) && !markersInFrame.includes(selectedMarker)) {
+    markersInFrame.push(selectedMarker);
+  }
+
   if (visibleMarkers.length < 2500) {
-    visibleMarkers.forEach((marker) => {
-      if (marker.bucketId !== "locations") drawMarker(marker, selectedId === marker.id, lightweight);
+    markersInFrame.forEach((marker) => {
+      if (marker.bucketId !== "locations") drawMarker(marker, selectedId === marker.id);
     });
-    visibleMarkers.forEach((marker) => {
-      if (marker.bucketId === "locations") drawMarker(marker, selectedId === marker.id, lightweight);
+    markersInFrame.forEach((marker) => {
+      if (marker.bucketId === "locations") drawMarker(marker, selectedId === marker.id);
     });
     return;
   }
 
   const cells = new Map();
-  const cellSize = isInteracting ? 72 : view.scale < 0.025 ? 58 : 46;
-  for (const marker of visibleMarkers) {
+  const cellSize = isInteracting ? 88 : view.scale < 0.025 ? 64 : 48;
+  for (const marker of markersInFrame) {
     const point = worldToScreen(marker.x, marker.y);
     if (point.x < -40 || point.y < -50 || point.x > canvas.width / dpr + 40 || point.y > canvas.height / dpr + 50) continue;
     if (marker.id === selectedId) {
-      drawMarker(marker, true, lightweight);
+      drawMarker(marker, true);
       continue;
     }
     const key = `${Math.floor(point.x / cellSize)}:${Math.floor(point.y / cellSize)}:${marker.bucketId}`;
@@ -812,7 +1132,7 @@ function drawVisibleMarkers() {
   for (const cluster of cells.values()) {
     cluster.x /= cluster.count;
     cluster.y /= cluster.count;
-    if (cluster.count === 1) drawMarker(cluster.sample, false, lightweight);
+    if (cluster.count === 1) drawMarker(cluster.sample, false);
     else drawCluster(cluster);
   }
 }
@@ -820,56 +1140,63 @@ function drawVisibleMarkers() {
 function drawPlayer() {
   if (!playerPosition) return;
   const point = worldToScreen(playerPosition.x, playerPosition.y);
-  ctx.save();
-  ctx.translate(point.x, point.y);
-  ctx.strokeStyle = "#76f5ec";
-  ctx.fillStyle = "rgba(118, 245, 236, 0.22)";
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.arc(0, 0, 18, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.stroke();
-  ctx.fillStyle = "#76f5ec";
-  ctx.beginPath();
-  ctx.arc(0, 0, 5, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.restore();
+  markerCtx.save();
+  markerCtx.translate(point.x, point.y);
+  markerCtx.strokeStyle = "#76f5ec";
+  markerCtx.fillStyle = "rgba(118, 245, 236, 0.22)";
+  markerCtx.lineWidth = 2;
+  markerCtx.beginPath();
+  markerCtx.arc(0, 0, 18, 0, Math.PI * 2);
+  markerCtx.fill();
+  markerCtx.stroke();
+  markerCtx.fillStyle = "#76f5ec";
+  markerCtx.beginPath();
+  markerCtx.arc(0, 0, 5, 0, Math.PI * 2);
+  markerCtx.fill();
+  markerCtx.restore();
 }
 
 function drawHoverTooltip() {
   if (!hoveredMarker || hoveredMarker.id === selectedMarker?.id) return;
   const point = worldToScreen(hoveredMarker.x, hoveredMarker.y);
   const text = hoveredMarker.title;
-  ctx.font = "600 12px Inter, sans-serif";
+  markerCtx.font = "600 12px Inter, sans-serif";
   const padX = 10;
-  const boxWidth = ctx.measureText(text).width + padX * 2;
+  const boxWidth = markerCtx.measureText(text).width + padX * 2;
   const boxHeight = 26;
   const x = point.x - boxWidth / 2;
   const y = point.y - 46;
-  ctx.save();
-  ctx.fillStyle = "rgba(7, 14, 26, 0.94)";
-  ctx.strokeStyle = "rgba(125, 99, 255, 0.55)";
-  ctx.lineWidth = 1;
+  markerCtx.save();
+  markerCtx.fillStyle = "rgba(7, 14, 26, 0.94)";
+  markerCtx.strokeStyle = "rgba(125, 99, 255, 0.55)";
+  markerCtx.lineWidth = 1;
   const radius = 6;
-  ctx.beginPath();
-  ctx.moveTo(x + radius, y);
-  ctx.arcTo(x + boxWidth, y, x + boxWidth, y + boxHeight, radius);
-  ctx.arcTo(x + boxWidth, y + boxHeight, x, y + boxHeight, radius);
-  ctx.arcTo(x, y + boxHeight, x, y, radius);
-  ctx.arcTo(x, y, x + boxWidth, y, radius);
-  ctx.closePath();
-  ctx.fill();
-  ctx.stroke();
-  ctx.fillStyle = "#f3f0ff";
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
-  ctx.fillText(text, point.x, y + boxHeight / 2);
-  ctx.restore();
+  markerCtx.beginPath();
+  markerCtx.moveTo(x + radius, y);
+  markerCtx.arcTo(x + boxWidth, y, x + boxWidth, y + boxHeight, radius);
+  markerCtx.arcTo(x + boxWidth, y + boxHeight, x, y + boxHeight, radius);
+  markerCtx.arcTo(x, y + boxHeight, x, y, radius);
+  markerCtx.arcTo(x, y, x + boxWidth, y, radius);
+  markerCtx.closePath();
+  markerCtx.fill();
+  markerCtx.stroke();
+  markerCtx.fillStyle = "#f3f0ff";
+  markerCtx.textAlign = "center";
+  markerCtx.textBaseline = "middle";
+  markerCtx.fillText(text, point.x, y + boxHeight / 2);
+  markerCtx.restore();
 }
 
 function draw() {
+  canvas.style.transform = "";
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   drawMapBackground();
+  renderedView = { ...view };
+}
+
+function renderMarkersLayer() {
+  markerCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  markerCtx.clearRect(0, 0, markerCanvas.width / dpr, markerCanvas.height / dpr);
   drawVisibleMarkers();
   drawPlayer();
   drawHoverTooltip();
@@ -884,21 +1211,29 @@ function update() {
 }
 
 function fitView() {
-  const width = canvas.clientWidth;
-  const height = canvas.clientHeight;
+  const { width, height } = stageSize();
   const size = mapSize();
   const scale = Math.min(width / size.width, height / size.height) * 0.92;
   minScale = scale * 0.6;
   view.scale = scale;
-  view.x = (width - size.width * scale) / 2;
-  view.y = (height - size.height * scale) / 2;
+  view.x = canvasBuffer + (width - size.width * scale) / 2;
+  view.y = canvasBuffer + (height - size.height * scale) / 2;
 }
 
 let resizeFrame = null;
 function resize() {
-  dpr = Math.max(1, Math.min(1.35, window.devicePixelRatio || 1));
-  canvas.width = Math.floor(canvas.clientWidth * dpr);
-  canvas.height = Math.floor(canvas.clientHeight * dpr);
+  dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const { width, height } = stageSize();
+  const canvasWidth = width + canvasBuffer * 2;
+  const canvasHeight = height + canvasBuffer * 2;
+  canvas.style.width = `${canvasWidth}px`;
+  canvas.style.height = `${canvasHeight}px`;
+  canvas.width = Math.floor(canvasWidth * dpr);
+  canvas.height = Math.floor(canvasHeight * dpr);
+  markerCanvas.style.width = `${canvasWidth}px`;
+  markerCanvas.style.height = `${canvasHeight}px`;
+  markerCanvas.width = Math.floor(canvasWidth * dpr);
+  markerCanvas.height = Math.floor(canvasHeight * dpr);
   fitView();
   scheduleDraw();
 }
@@ -921,15 +1256,23 @@ function zoomAt(screenX, screenY, factor) {
 }
 
 function findMarker(screenX, screenY) {
+  const world = screenToWorld(screenX, screenY);
+  const cx = Math.floor(world.x / gridCellSize);
+  const cy = Math.floor(world.y / gridCellSize);
   let best = null;
   let bestDistance = 18;
-  for (let i = visibleMarkers.length - 1; i >= 0; i -= 1) {
-    const marker = visibleMarkers[i];
-    const point = worldToScreen(marker.x, marker.y);
-    const distance = Math.hypot(point.x - screenX, point.y - screenY);
-    if (distance < bestDistance) {
-      best = marker;
-      bestDistance = distance;
+  for (let dx = -1; dx <= 1; dx += 1) {
+    for (let dy = -1; dy <= 1; dy += 1) {
+      const cell = markerGrid.get(`${cx + dx}:${cy + dy}`);
+      if (!cell) continue;
+      for (const marker of cell) {
+        const point = worldToScreen(marker.x, marker.y);
+        const distance = Math.hypot(point.x - screenX, point.y - screenY);
+        if (distance < bestDistance) {
+          best = marker;
+          bestDistance = distance;
+        }
+      }
     }
   }
   return best;
@@ -1006,8 +1349,8 @@ function hidePopup() {
 function positionPopup() {
   if (!selectedMarker || popup.hidden) return;
   const point = worldToScreen(selectedMarker.x, selectedMarker.y);
-  popup.style.left = `${point.x}px`;
-  popup.style.top = `${point.y}px`;
+  popup.style.left = `${point.x - canvasBuffer}px`;
+  popup.style.top = `${point.y - canvasBuffer}px`;
 }
 
 function parseCoord(value) {
@@ -1028,8 +1371,9 @@ function setPlayerPosition(x, y) {
   coordY.value = Math.round(playerPosition.y);
   positionReadout.textContent = `Set to X ${Math.round(playerPosition.x).toLocaleString("en-US")}, Y ${Math.round(playerPosition.y).toLocaleString("en-US")}`;
   const point = worldToScreen(playerPosition.x, playerPosition.y);
-  view.x += canvas.clientWidth / 2 - point.x;
-  view.y += canvas.clientHeight / 2 - point.y;
+  const center = visibleCenter();
+  view.x += center.x - point.x;
+  view.y += center.y - point.y;
   scheduleDraw();
 }
 
@@ -1061,8 +1405,14 @@ function initEvents() {
   document.querySelector("#markersTab").addEventListener("click", () => setTab("markers"));
   document.querySelector("#positionTab").addEventListener("click", () => setTab("position"));
 
-  document.querySelector("#zoomIn").addEventListener("click", () => zoomAt(canvas.clientWidth / 2, canvas.clientHeight / 2, 1.35));
-  document.querySelector("#zoomOut").addEventListener("click", () => zoomAt(canvas.clientWidth / 2, canvas.clientHeight / 2, 0.75));
+  document.querySelector("#zoomIn").addEventListener("click", () => {
+    const center = visibleCenter();
+    zoomAt(center.x, center.y, 1.35);
+  });
+  document.querySelector("#zoomOut").addEventListener("click", () => {
+    const center = visibleCenter();
+    zoomAt(center.x, center.y, 0.75);
+  });
   document.querySelector("#resetView").addEventListener("click", () => {
     fitView();
     scheduleDraw();
@@ -1070,28 +1420,38 @@ function initEvents() {
 
   canvas.addEventListener("pointerdown", (event) => {
     canvas.setPointerCapture(event.pointerId);
-    beginInteraction();
+    beginInteraction("pan");
     isDragging = true;
+    hoveredMarker = null;
     canvas.style.cursor = "grabbing";
     dragStart = { x: event.clientX, y: event.clientY, viewX: view.x, viewY: view.y };
   });
 
+  let hoverQueued = false;
+  let hoverPoint = null;
   canvas.addEventListener("pointermove", (event) => {
-    const rect = canvas.getBoundingClientRect();
-    const screenX = event.clientX - rect.left;
-    const screenY = event.clientY - rect.top;
+    const point = eventToCanvasPoint(event);
+    const screenX = point.x;
+    const screenY = point.y;
     if (isDragging && dragStart) {
       view.x = dragStart.viewX + event.clientX - dragStart.x;
       view.y = dragStart.viewY + event.clientY - dragStart.y;
       scheduleDraw();
       return;
     }
-    const marker = findMarker(screenX, screenY);
-    if (marker !== hoveredMarker) {
-      hoveredMarker = marker;
-      canvas.style.cursor = marker ? "pointer" : "grab";
-      scheduleDraw();
-    }
+    hoverPoint = { x: screenX, y: screenY };
+    if (hoverQueued) return;
+    hoverQueued = true;
+    window.requestAnimationFrame(() => {
+      hoverQueued = false;
+      if (isDragging) return;
+      const marker = hoverPoint ? findMarker(hoverPoint.x, hoverPoint.y) : null;
+      if (marker !== hoveredMarker) {
+        hoveredMarker = marker;
+        canvas.style.cursor = marker ? "pointer" : "grab";
+        scheduleDraw();
+      }
+    });
   });
 
   canvas.addEventListener("pointerleave", () => {
@@ -1102,6 +1462,7 @@ function initEvents() {
     if (!isDragging) canvas.style.cursor = "grab";
   });
 
+  let lastClickTime = 0;
   canvas.addEventListener("pointerup", (event) => {
     const moved = dragStart ? Math.hypot(event.clientX - dragStart.x, event.clientY - dragStart.y) : 0;
     isDragging = false;
@@ -1109,23 +1470,30 @@ function initEvents() {
     canvas.style.cursor = hoveredMarker ? "pointer" : "grab";
     endInteraction();
     if (moved > 5) return;
-    const rect = canvas.getBoundingClientRect();
-    const marker = findMarker(event.clientX - rect.left, event.clientY - rect.top);
+    const now = performance.now();
+    const isDoubleClick = now - lastClickTime < 350;
+    lastClickTime = now;
+    if (isDoubleClick) return;
+    const point = eventToCanvasPoint(event);
+    const marker = findMarker(point.x, point.y);
     if (marker) showPopup(marker);
     else hidePopup();
   });
 
   canvas.addEventListener("wheel", (event) => {
     event.preventDefault();
-    beginInteraction();
-    const rect = canvas.getBoundingClientRect();
-    zoomAt(event.clientX - rect.left, event.clientY - rect.top, event.deltaY < 0 ? 1.16 : 0.86);
-    endInteraction(180);
+    beginInteraction("zoom");
+    hoveredMarker = null;
+    const point = eventToCanvasPoint(event);
+    const delta = Math.max(-120, Math.min(120, event.deltaY));
+    const factor = Math.exp(-delta * 0.0016);
+    scheduleWheelZoom(point, factor);
+    endInteraction(250);
   }, { passive: false });
 
   canvas.addEventListener("dblclick", (event) => {
-    const rect = canvas.getBoundingClientRect();
-    zoomAt(event.clientX - rect.left, event.clientY - rect.top, 1.8);
+    const point = eventToCanvasPoint(event);
+    zoomAt(point.x, point.y, 1.8);
   });
 
   document.querySelector("#positionForm").addEventListener("submit", (event) => {
@@ -1144,7 +1512,16 @@ function setTab(tab) {
   document.querySelector("#positionPanel").classList.toggle("is-active", !markers);
 }
 
+function hideMapLoading() {
+  const mapLoading = document.querySelector("#mapLoading");
+  if (!mapLoading) return;
+  mapLoading.classList.add("is-hidden");
+  window.setTimeout(() => mapLoading.remove(), 320);
+}
+
 generateMarkers();
 initEvents();
 resize();
 update();
+window.requestAnimationFrame(() => window.requestAnimationFrame(hideMapLoading));
+window.setTimeout(prefetchBaseTiles, 600);
